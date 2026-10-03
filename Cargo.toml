@@ -1,0 +1,27 @@
+[package]
+name = "full-size-preview-h"
+version = "0.5.0"
+edition = "2021"
+license = "MIT"
+authors = ["HexBrowns"]
+description = "FullSizePreview_H - 空白キーのプレビュー再生を等倍の別ウィンドウに映す AviUtl2 プラグイン"
+publish = false
+
+[lib]
+name = "full_size_preview_h"
+crate-type = ["cdylib"]
+
+[dependencies]
+aviutl2 = { version = "0.47", features = ["generic"] }
+parking_lot = "0.12"
+tracing = "0.1"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
