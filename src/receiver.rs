@@ -13,13 +13,15 @@
 //! - 自分自身は 1x1 の透明な画像を出し、不透明度も 0 にして画面には何も描かない
 //! - 画像は本体の API（`copy_image_resource` → `get_image_resource_data`）で読む（`readback`）
 //! - ウィンドウが開いていないときは画像を読み出さないので、置いたままでも編集・出力の重さはほぼ変わらない
+//! - **VideoScope_H（ビデオスコープ）が再生中に欲しがっていれば、ウィンドウが閉じていても読み、共有メモリへ書く**
+//!   （`share.rs`。VideoScope_H が期限を書き、こちらは 100ms ごとに 1 枚。期限が切れれば読まない。v0.6.0）
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use aviutl2::AnyResult;
 
-use crate::{preview, readback};
+use crate::{preview, readback, share};
 
 /// エフェクト名（`.aup2` の `effect.name` に保存される。変えると保存済みのプロジェクトから外れる）
 pub const RECEIVER_NAME: &str = "フルサイズプレビュー受け口";
@@ -57,13 +59,26 @@ impl aviutl2::filter::FilterPlugin for Receiver {
         _config: &[aviutl2::filter::FilterConfigItem],
         video: &mut aviutl2::filter::FilterProcVideo<Self::Userdata>,
     ) -> AnyResult<()> {
-        if preview::wants_frames() {
+        let to_preview = preview::wants_frames();
+        let now_ms = share::now_ms();
+        let to_scope = share::region().filter(|r| r.due(now_ms));
+        if to_preview || to_scope.is_some() {
             let frame = video.object.frame_s as usize + video.object.frame as usize;
             let effect_id = video.object.effect_id;
             let mut buffer = preview::take_buffer();
             let t0 = Instant::now();
             match readback::read(video, &mut buffer) {
-                Ok(rb) => preview::push(effect_id, frame, rb, buffer, t0.elapsed()),
+                Ok(rb) => {
+                    let took = t0.elapsed();
+                    if let Some(r) = to_scope {
+                        r.publish(frame as u32, rb.width, rb.height, &buffer, now_ms, took.as_micros().min(u32::MAX as u128) as u32);
+                    }
+                    if to_preview {
+                        preview::push(effect_id, frame, rb, buffer, took);
+                    } else {
+                        preview::give_back(buffer);
+                    }
+                }
                 Err(e) => {
                     if !READ_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
                         tracing::warn!("FullSizePreview_H: フレームバッファを読み出せませんでした: {e}");

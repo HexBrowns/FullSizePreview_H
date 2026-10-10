@@ -12,6 +12,7 @@ mod preview;
 mod readback;
 mod receiver;
 mod settings;
+pub mod share;
 
 use aviutl2::generic::{EditState, GlobalEditHandle};
 use aviutl2::AnyResult;
