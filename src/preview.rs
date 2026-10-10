@@ -12,14 +12,14 @@
 //!   「モニター」の小さい方（縦横比を保つ）。シーンの方が小さければ等倍で、余白を作らない
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect,
     MonitorFromWindow, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchDIBits,
@@ -27,15 +27,18 @@ use windows::Win32::Graphics::Gdi::{
     DT_VCENTER, HALFTONE, HBRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY,
     TRANSPARENT,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{
+    GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
+    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+};
 use windows::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
     LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow,
-    TranslateMessage, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SW_HIDE, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEACTIVATE,
+    TranslateMessage, UnregisterClassW, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MSG,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEACTIVATE,
     WM_PAINT, WM_RBUTTONDOWN, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP,
 };
@@ -48,6 +51,13 @@ use crate::EDIT_HANDLE;
 const WM_APP_SHOW: u32 = WM_APP + 1;
 const WM_APP_HIDE: u32 = WM_APP + 2;
 const WM_APP_QUIT: u32 = WM_APP + 3;
+
+/// ウィンドウクラスの名前。この DLL の HINSTANCE で登録し、`shutdown` で外す
+const CLASS_NAME: PCWSTR = w!("FullSizePreview_H_Window");
+/// ウィンドウができるのを待つ上限。超えたらこの回の再生では開かない（できたら次の再生から使う）
+const WINDOW_CREATE_TIMEOUT: Duration = Duration::from_secs(3);
+/// 終了時にスレッドの終わりを待つ上限（全部合わせて）。超えたら警告して DLL を pin する
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 届いたフレームを溜めておく上限（枚数と合計バイト）。本体の再生バッファ（既定 500ms）より多めに取る
 const QUEUE_MAX_FRAMES: usize = 30;
@@ -116,9 +126,130 @@ struct Stats {
     receivers: Vec<i64>,
 }
 
-struct Preview {
+/// ウィンドウのスレッドと `shutdown` の受け渡し。
+///
+/// ウィンドウはそのスレッドが自分で載せる（`publish`）。生成が `WINDOW_CREATE_TIMEOUT` を過ぎて遅れて
+/// できた場合も載るので、`shutdown` は WM_APP_QUIT を送れる。載せるのと終了の印（`request_quit`）が
+/// 行き違っても、どちらかが必ず相手に気づく（どちらも「書いてから読む」を SeqCst で行う）。
+/// 終了の印を見たウィンドウのスレッドは、自分でウィンドウを壊して抜ける
+struct WindowSlot {
     hwnd: AtomicIsize,
+    quitting: AtomicBool,
+}
+
+impl WindowSlot {
+    const fn new() -> Self {
+        Self { hwnd: AtomicIsize::new(0), quitting: AtomicBool::new(false) }
+    }
+
+    fn get(&self) -> Option<isize> {
+        match self.hwnd.load(Ordering::SeqCst) {
+            0 => None,
+            h => Some(h),
+        }
+    }
+
+    fn is_quitting(&self) -> bool {
+        self.quitting.load(Ordering::SeqCst)
+    }
+
+    /// ウィンドウのスレッドから呼ぶ。作ったウィンドウを載せる。
+    /// 終了に入っていたら載せずに false を返す（呼んだ側が自分で壊して抜ける）
+    fn publish(&self, h: isize) -> bool {
+        self.hwnd.store(h, Ordering::SeqCst);
+        if self.quitting.load(Ordering::SeqCst) {
+            self.clear(h);
+            false
+        } else {
+            true
+        }
+    }
+
+    /// 終了に入る。載っているウィンドウがあれば返す（呼んだ側が WM_APP_QUIT を送る）
+    fn request_quit(&self) -> Option<isize> {
+        self.quitting.store(true, Ordering::SeqCst);
+        self.get()
+    }
+
+    /// `h` が載っていれば外す（別のウィンドウが載っていたら触らない）
+    fn clear(&self, h: isize) {
+        let _ = self.hwnd.compare_exchange(h, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+/// 終わりを待つ対象として覚えておくスレッドの一覧。`close_and_join` の後は起こさない
+struct Workers {
+    handles: Mutex<Vec<JoinHandle<()>>>,
+    closed: AtomicBool,
+}
+
+impl Workers {
+    const fn new() -> Self {
+        Self { handles: Mutex::new(Vec::new()), closed: AtomicBool::new(false) }
+    }
+
+    /// 名前付きのスレッドを起こして覚える。閉じた後と、起こせなかったときは false
+    fn spawn(&self, name: &str, f: impl FnOnce() + Send + 'static) -> bool {
+        let mut handles = self.handles.lock();
+        // 印はロックの中で見る（`close_and_join` が一覧を持ち去った後に足さない）
+        if self.closed.load(Ordering::SeqCst) {
+            return false;
+        }
+        // 終わったものは片付ける（終わっているので join はすぐ返る）
+        let mut i = 0;
+        while i < handles.len() {
+            if handles[i].is_finished() {
+                let _ = handles.swap_remove(i).join();
+            } else {
+                i += 1;
+            }
+        }
+        match std::thread::Builder::new().name(name.to_string()).spawn(f) {
+            Ok(h) => {
+                handles.push(h);
+                true
+            }
+            Err(e) => {
+                tracing::error!("FullSizePreview_H: スレッド「{name}」を立てられませんでした: {e}");
+                false
+            }
+        }
+    }
+
+    /// 閉じて（以後は起こさない）、起こしたスレッドが終わるのを `deadline` まで待つ。待ちきれなかった本数を返す
+    fn close_and_join(&self, deadline: Instant) -> usize {
+        let handles = {
+            let mut handles = self.handles.lock();
+            self.closed.store(true, Ordering::SeqCst);
+            std::mem::take(&mut *handles)
+        };
+        handles.into_iter().map(|h| join_until(h, deadline)).filter(|done| !done).count()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.handles.lock().len()
+    }
+}
+
+/// `deadline` まで終わりを待ち、終わったら join して true。間に合わなければ false（handle は手放す）
+fn join_until(handle: JoinHandle<()>, deadline: Instant) -> bool {
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if handle.is_finished() {
+        let _ = handle.join();
+        true
+    } else {
+        false
+    }
+}
+
+struct Preview {
+    window: WindowSlot,
     window_thread: Mutex<Option<JoinHandle<()>>>,
+    /// クリック・WM_CLOSE で閉じるために起こしたスレッド（`shutdown` で待つ）
+    stoppers: Workers,
     display_thread: Mutex<Option<JoinHandle<()>>>,
     /// 表示中のセッション番号（0 = 閉じている）。開くたびに増える
     session: AtomicU64,
@@ -140,8 +271,9 @@ struct Preview {
 }
 
 static PREVIEW: Preview = Preview {
-    hwnd: AtomicIsize::new(0),
+    window: WindowSlot::new(),
     window_thread: Mutex::new(None),
+    stoppers: Workers::new(),
     display_thread: Mutex::new(None),
     session: AtomicU64::new(0),
     next_session: AtomicU64::new(0),
@@ -167,10 +299,7 @@ static PREVIEW: Preview = Preview {
 };
 
 fn hwnd() -> Option<HWND> {
-    match PREVIEW.hwnd.load(Ordering::Acquire) {
-        0 => None,
-        h => Some(HWND(h as _)),
-    }
+    PREVIEW.window.get().map(|h| HWND(h as _))
 }
 
 fn set_status(text: impl Into<String>) {
@@ -268,7 +397,7 @@ fn pick(queue: &VecDeque<Incoming>, target: usize, past_window: usize) -> Option
         .map(|(i, _)| i)
 }
 
-/// ウィンドウのスレッドを立てる（1 回だけ）。
+/// ウィンドウのスレッドを立てる（1 本だけ）。
 fn ensure_window() -> Option<HWND> {
     if let Some(h) = hwnd() {
         return Some(h);
@@ -277,19 +406,43 @@ fn ensure_window() -> Option<HWND> {
     if let Some(h) = hwnd() {
         return Some(h);
     }
-    let (tx, rx) = std::sync::mpsc::channel::<isize>();
-    let handle = std::thread::Builder::new()
+    if PREVIEW.window.is_quitting() {
+        return None;
+    }
+    if let Some(t) = guard.take() {
+        if !t.is_finished() {
+            // 前の回の生成が時間切れの後もまだ続いている。2 本目は立てない（できたら次の再生から使う）
+            *guard = Some(t);
+            tracing::warn!("FullSizePreview_H: プレビューウィンドウをまだ作っている途中です（この再生では開きません）");
+            return None;
+        }
+        // 生成に失敗して抜けたスレッド。片付けて作り直す
+        let _ = t.join();
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let handle = match std::thread::Builder::new()
         .name("FullSizePreview_H window".into())
         .spawn(move || window_thread(tx))
-        .ok()?;
-    *guard = Some(handle);
-    match rx.recv_timeout(Duration::from_secs(3)) {
-        Ok(h) if h != 0 => {
-            PREVIEW.hwnd.store(h, Ordering::Release);
-            Some(HWND(h as _))
+    {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!("FullSizePreview_H: ウィンドウのスレッドを立てられませんでした: {e}");
+            return None;
         }
-        _ => {
+    };
+    *guard = Some(handle);
+    match rx.recv_timeout(WINDOW_CREATE_TIMEOUT) {
+        // ウィンドウはスレッドが自分で載せている
+        Ok(true) => hwnd(),
+        Ok(false) => {
             tracing::error!("FullSizePreview_H: プレビューウィンドウを作れませんでした");
+            None
+        }
+        Err(_) => {
+            tracing::error!(
+                "FullSizePreview_H: プレビューウィンドウが {} 秒以内にできませんでした（この再生では開きません）",
+                WINDOW_CREATE_TIMEOUT.as_secs()
+            );
             None
         }
     }
@@ -398,18 +551,81 @@ fn stop_locked() {
     );
 }
 
-/// プラグインの解放時に呼ぶ。スレッドを止める。
+/// ウィンドウのクリック・WM_CLOSE から呼ぶ。閉じる処理（描画スレッドの join を含む）を別のスレッドで行う。
+///
+/// ウィンドウのスレッドで join を待たないのは、その間このウィンドウのメッセージが止まるため
+/// （描画スレッドは本体の関数 `get_edit_info` を呼んでいて、どれだけ待たされるかはこちらで決められない）。
+/// 起こしたスレッドは `shutdown` で終わりを待つ
+fn request_stop() {
+    if is_open() {
+        PREVIEW.stoppers.spawn("FullSizePreview_H stop", stop);
+    }
+}
+
+/// プラグインの解放時に呼ぶ（プラグインの Drop）。起こしたスレッドを全部止めて終わりを待ち、ウィンドウクラスを外す。
 pub fn shutdown() {
+    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+    // 1. クリックで起こした「閉じる」スレッドを待つ（以後は起こさない）
+    let mut left = PREVIEW.stoppers.close_and_join(deadline);
+    // 2. 表示を止める（描画スレッドを join する）
     stop();
-    if let Some(h) = hwnd() {
+    // 3. ウィンドウのスレッドを止める。生成が時間切れの後に遅れてできた場合も、終了の印を見て自分で抜ける
+    if let Some(h) = PREVIEW.window.request_quit() {
         unsafe {
-            let _ = PostMessageW(Some(h), WM_APP_QUIT, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(Some(HWND(h as _)), WM_APP_QUIT, WPARAM(0), LPARAM(0));
         }
     }
-    if let Some(t) = PREVIEW.window_thread.lock().take() {
-        let _ = t.join();
+    let window_done = match PREVIEW.window_thread.lock().take() {
+        Some(t) => join_until(t, deadline),
+        None => true,
+    };
+    if window_done {
+        // ウィンドウが全部壊れた後で外す。残すと、DLL が外れた後も消えた wnd_proc を指すクラスが残る
+        if let Some(instance) = dll_instance() {
+            unsafe {
+                let _ = UnregisterClassW(CLASS_NAME, Some(instance));
+            }
+        }
+    } else {
+        left += 1;
     }
-    PREVIEW.hwnd.store(0, Ordering::Release);
+    if left > 0 {
+        tracing::warn!("FullSizePreview_H: 終了時に {left} 本のスレッドが時間内に止まりませんでした（DLL を外させないようにします）");
+        pin_module();
+    }
+}
+
+/// この DLL の HINSTANCE（ウィンドウクラスの登録と生成に使う）。
+fn dll_instance() -> Option<HINSTANCE> {
+    let mut module = HMODULE::default();
+    let anchor = dll_instance as *const () as *const u16;
+    // SAFETY: FROM_ADDRESS では `anchor` をこの DLL の中のアドレスとして読むだけ。参照カウントは変えない
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            PCWSTR(anchor),
+            &mut module,
+        )
+        .ok()?;
+    }
+    Some(module.into())
+}
+
+/// 止まらないスレッドが残ったとき、この DLL をプロセスが終わるまで外させない（`au2-rs-plugin` の保険）。
+fn pin_module() {
+    let mut module = HMODULE::default();
+    let anchor = pin_module as *const () as *const u16;
+    // SAFETY: 同上。PIN はプロセスの終わりまで外させない
+    let result = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            PCWSTR(anchor),
+            &mut module,
+        )
+    };
+    if let Err(e) = result {
+        tracing::warn!("FullSizePreview_H: DLL を pin できませんでした: {e}");
+    }
 }
 
 /// 再生位置が変わるたびに、溜めたフレームから合うものを選んで出す。
@@ -623,25 +839,31 @@ fn composite(premul: &[u8], width: u32, height: u32, compose: &Compose) -> Optio
 
 // ---- ウィンドウ ----
 
-fn window_thread(tx: std::sync::mpsc::Sender<isize>) {
+/// ウィンドウを作ってメッセージを回す。作れたかを `tx` で知らせる（待つ側が時間切れで先に抜けていてもよい）。
+fn window_thread(tx: std::sync::mpsc::Sender<bool>) {
     unsafe {
         // モニターの実ピクセルで大きさを決める（等倍表示のため）。このスレッドで作るウィンドウだけに効く
         let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-        let instance = GetModuleHandleW(None).unwrap_or_default();
-        let class_name = w!("FullSizePreview_H_Window");
+        // exe ではなくこの DLL の HINSTANCE で登録する（`shutdown` で外す）
+        let Some(instance) = dll_instance() else {
+            tracing::error!("FullSizePreview_H: この DLL のハンドルを取れませんでした");
+            let _ = tx.send(false);
+            return;
+        };
         let class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wnd_proc),
-            hInstance: instance.into(),
+            hInstance: instance,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            lpszClassName: class_name,
+            lpszClassName: CLASS_NAME,
             ..Default::default()
         };
+        // 作り直し（前の回の生成に失敗した後）では登録済みで 0 が返る。本当に無ければ生成の側で失敗する
         RegisterClassExW(&class);
         let created = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            class_name,
+            CLASS_NAME,
             w!("フルサイズプレビュー"),
             WS_POPUP,
             0,
@@ -650,24 +872,32 @@ fn window_thread(tx: std::sync::mpsc::Sender<isize>) {
             360,
             None,
             None,
-            Some(instance.into()),
+            Some(instance),
             None,
         );
         let hwnd = match created {
             Ok(h) => h,
             Err(e) => {
                 tracing::error!("FullSizePreview_H: CreateWindowExW 失敗: {e}");
-                let _ = tx.send(0);
+                let _ = tx.send(false);
                 return;
             }
         };
-        let _ = tx.send(hwnd.0 as isize);
+        let raw = hwnd.0 as isize;
+        if !PREVIEW.window.publish(raw) {
+            // 作っている間に終了に入った。`shutdown` はこのウィンドウを知らないので、自分で壊して抜ける
+            let _ = DestroyWindow(hwnd);
+            let _ = tx.send(false);
+            return;
+        }
+        let _ = tx.send(true);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        PREVIEW.window.clear(raw);
     }
 }
 
@@ -743,17 +973,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         // フォーカスを取らない（空白キーを本体に届け続ける）
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
-        // クリックで閉じる（再生は続く）。ワーカーで閉じるのは、描画スレッドの join をこのスレッドで待たないため
-        WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
-            if is_open() {
-                std::thread::spawn(stop);
-            }
-            LRESULT(0)
-        }
-        WM_CLOSE => {
-            if is_open() {
-                std::thread::spawn(stop);
-            }
+        // クリックで閉じる（再生は続く）。別のスレッドで閉じるのは、描画スレッドの join をこのスレッドで待たないため。
+        // そのスレッドは `shutdown` で終わりを待つ（`request_stop`）
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_CLOSE => {
+            request_stop();
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
@@ -957,6 +1180,104 @@ mod tests {
         // まだ何も届いていない番号しかなければ出さない
         let q = queue(&[20, 21]);
         assert_eq!(pick(&q, 11, 90), None);
+    }
+
+    #[test]
+    fn window_slot_publish_then_quit_hands_over_window() {
+        let slot = WindowSlot::new();
+        assert!(slot.publish(42));
+        assert_eq!(slot.get(), Some(42));
+        // shutdown はウィンドウを受け取って WM_APP_QUIT を送る
+        assert_eq!(slot.request_quit(), Some(42));
+        slot.clear(42);
+        assert_eq!(slot.get(), None);
+    }
+
+    #[test]
+    fn window_slot_late_window_after_quit_is_refused() {
+        // 生成が時間切れの後に遅れてできた: shutdown はウィンドウを知らないまま印を立てる
+        let slot = WindowSlot::new();
+        assert_eq!(slot.request_quit(), None);
+        assert!(slot.is_quitting());
+        // ウィンドウのスレッドは載せられず、自分で壊して抜ける
+        assert!(!slot.publish(7));
+        assert_eq!(slot.get(), None);
+    }
+
+    #[test]
+    fn window_slot_clear_keeps_other_window() {
+        let slot = WindowSlot::new();
+        assert!(slot.publish(5));
+        slot.clear(6);
+        assert_eq!(slot.get(), Some(5));
+    }
+
+    #[test]
+    fn window_slot_race_never_loses_window() {
+        // 載せるのと終了の印が行き違っても、「載った」のに shutdown が受け取れない組み合わせは起きない
+        for _ in 0..2000 {
+            let slot = Arc::new(WindowSlot::new());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let (s, b) = (slot.clone(), barrier.clone());
+            let publisher = std::thread::spawn(move || {
+                b.wait();
+                s.publish(99)
+            });
+            barrier.wait();
+            let seen = slot.request_quit();
+            let published = publisher.join().unwrap();
+            assert!(!published || seen == Some(99), "published={published} seen={seen:?}");
+        }
+    }
+
+    #[test]
+    fn workers_join_spawned_threads() {
+        let workers = Workers::new();
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        assert!(workers.spawn("test", move || {
+            std::thread::sleep(Duration::from_millis(50));
+            d.store(true, Ordering::SeqCst);
+        }));
+        assert_eq!(workers.close_and_join(Instant::now() + Duration::from_secs(5)), 0);
+        assert!(done.load(Ordering::SeqCst), "終わりを待ってから返る");
+    }
+
+    #[test]
+    fn workers_refuse_after_close() {
+        let workers = Workers::new();
+        assert_eq!(workers.close_and_join(Instant::now()), 0);
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+        assert!(!workers.spawn("test", move || r.store(true, Ordering::SeqCst)));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(workers.len(), 0);
+    }
+
+    #[test]
+    fn workers_report_threads_that_do_not_stop() {
+        let workers = Workers::new();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        assert!(workers.spawn("test", move || {
+            let _ = release_rx.recv();
+        }));
+        let started = Instant::now();
+        assert_eq!(workers.close_and_join(started + Duration::from_millis(100)), 1);
+        assert!(started.elapsed() < Duration::from_secs(2), "上限で打ち切る");
+        let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn workers_reap_finished_threads() {
+        let workers = Workers::new();
+        for _ in 0..5 {
+            assert!(workers.spawn("test", || {}));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // 終わったものは次に起こすときに片付く（溜まり続けない）
+        assert!(workers.len() <= 2, "len={}", workers.len());
+        assert_eq!(workers.close_and_join(Instant::now() + Duration::from_secs(5)), 0);
     }
 
     #[test]

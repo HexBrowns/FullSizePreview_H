@@ -2,7 +2,7 @@
 
 **FullSizePreview_H** は、**空白キー**でプレビュー再生したときに、シーンを**等倍**で映す別ウィンドウを出すプラグイン（Rust 製 `.aux2`）です。プレビュー編集画面は小さく縮めて表示されますが、このウィンドウでは 1920x1080 のシーンを 1920x1080 のまま確かめられます。
 
-- **バージョン:** 0.5.0（受け口がフィルタオブジェクトからカスタムオブジェクトに変わった。0.4.0 以前に置いた受け口は消して置き直す）
+- **バージョン:** 0.5.1（2026-10-10: フルサイズプレビューをクリックで閉じた直後に AviUtl2 を終了・再起動すると落ちることがあったのを直した。使い方は変わらない。0.5.0 で受け口がフィルタオブジェクトからカスタムオブジェクトに変わった。0.4.0 以前に置いた受け口は消して置き直す）
 - **作者:** by HexBrowns
 - **必要環境:** AviUtl2 **2.1.10** 以上（2.1.11 で確認）
 
@@ -12,16 +12,21 @@
 
 ## 導入
 
-1. [Releases](https://github.com/HexBrowns/FullSizePreview_H/releases) の zip を展開し、中の `Plugin` フォルダを AviUtl2 のデータフォルダ（既定は `C:\ProgramData\aviutl2`）へコピーする（`Plugin\FullSizePreview_H\FullSizePreview_H.aux2` になる）
-2. AviUtl2 を再起動
+1. [Releases](https://github.com/HexBrowns/FullSizePreview_H/releases) から `HexBrowns.FullSizePreview_H-v0.5.1.au2pkg.zip` をダウンロードし、AviUtl2 のプレビューへドラッグ&ドロップする
+   （手で置くなら、中の `Plugin` フォルダを AviUtl2 のデータフォルダ（既定は `C:\ProgramData\aviutl2`）へコピーする。`Plugin\FullSizePreview_H\FullSizePreview_H.aux2` になる）
+2. AviUtl2 を再起動する
+
+v0.5.0 までは zip を展開して置く形でした。上書きで入れ替えて構いません。
 
 設定メニューはありません。**受け口を置いたシーンでだけ動きます**（下記）。
 
 ### ビルド（開発者向け）
 
+リポジトリのルートで [aviutl2-cli](https://github.com/sevenc-nanashi/aviutl2-cli) の `au2` を実行します。
+`release/` に、AviUtl2 のプレビューへドラッグ&ドロップして導入できるパッケージ（`.au2pkg.zip`）ができます。
+
 ```powershell
-cd AI\plugins\FullSizePreview_H
-.\build.ps1
+au2 release
 ```
 
 ---

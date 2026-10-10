@@ -3,7 +3,7 @@
 空白キーでプレビュー再生したとき、シーンを**等倍**で映す別ウィンドウを出す汎用プラグイン（aviutl2-rs 0.47）。
 プレビュー編集画面とは別の独立したウィンドウにしたのは、タブウィンドウのドッキングを SDK から制御しにくいため（ユーザーの判断、2026-09-27）。
 
-- ビルド: `& "C:\ProgramData\aviutl2\AI\plugins\FullSizePreview_H\build.ps1"` → `Plugin/FullSizePreview_H/FullSizePreview_H.aux2`
+- ビルド: `python AI/tools/au2_build.py FullSizePreview_H` → `Plugin/FullSizePreview_H/FullSizePreview_H.aux2`（ビルドと同梱物は `aviutl2.toml`。`au2 release` だけなら `release/` に au2pkg）
 - 単体テスト: `cargo test --release`（画素の変換、ウィンドウの大きさ、再生位置の見積もり、フレームの選び方）
 - 設定は持たない。**カスタムオブジェクト「フルサイズプレビュー受け口」を置いたシーンでだけ動く**（ユーザーの指定、2026-09-27）
 
