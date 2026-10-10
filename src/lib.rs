@@ -6,6 +6,9 @@
 //! - 再生が止まると閉じる。ウィンドウをクリックしても閉じる（再生は続く）
 //! - 受け口は編集メニュー／レイヤーの右クリックメニュー「フルサイズプレビュー受け口を置く」で置ける（`placer`）
 
+mod compose;
+#[cfg(test)]
+mod cost_tests;
 mod input;
 mod placer;
 mod preview;
@@ -13,6 +16,7 @@ mod readback;
 mod receiver;
 mod settings;
 pub mod share;
+mod throttle;
 
 use aviutl2::generic::{EditState, GlobalEditHandle};
 use aviutl2::AnyResult;

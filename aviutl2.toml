@@ -7,7 +7,7 @@
 [project]
 id = "HexBrowns.FullSizePreview_H"
 name = "FullSizePreview_H"
-version = "0.6.0"
+version = "0.6.1"
 
 [artifacts."FullSizePreview_H.aux2"]
 build = "cargo build --release"

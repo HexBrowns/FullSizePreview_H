@@ -9,7 +9,12 @@
 //!   （実機 2026-09-27: 5 秒再生して 0 のまま）ので、開始時のカーソル位置 ＋ 経過時間 × fps × 再生速度
 //!   （`aviutl2.ini` の `[Player] Speed`）で数える
 //! - ウィンドウは本体のメインウィンドウがあるモニターの中央に置き、大きさは「シーンの解像度」と
-//!   「モニター」の小さい方（縦横比を保つ）。シーンの方が小さければ等倍で、余白を作らない
+//!   「モニター」の小さい方（縦横比を保つ）。シーンの方が小さければ等倍で、余白を作らない。
+//!   シーンの方が大きければ、表示スレッドでウィンドウの大きさへ縮めてから渡す（`compose`。GDI では等倍で描く）
+//! - **本体の再生 fps を落とさない**（v0.6.1）: 受け口の読み出しは本体の描画スレッドに上乗せされるので、
+//!   本体が追いつかなくなったら間引く（`throttle`）。表示スレッドは次のフレームの時刻か新しい 1 枚が届くまで眠り、
+//!   本体の参照ロックを取る `get_edit_info` は 0.1 秒に 1 回まで
+//! - 本体以外のアプリが前に出たら最前面をやめ、そのアプリの後ろへ下がる。本体へ戻ったら最前面に戻す（v0.6.1）
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
@@ -17,15 +22,14 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect,
-    MonitorFromWindow, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchDIBits,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLACK_BRUSH, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE,
-    DT_VCENTER, HALFTONE, HBRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY,
-    TRANSPARENT,
+    MonitorFromWindow, SetBkMode, SetStretchBltMode, SetTextColor, StretchDIBits, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, BLACK_BRUSH, COLORONCOLOR, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE,
+    DT_VCENTER, HBRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{
     GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
@@ -34,16 +38,20 @@ use windows::Win32::System::LibraryLoader::{
 use windows::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow,
-    TranslateMessage, UnregisterClassW, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MSG,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEACTIVATE,
-    WM_PAINT, WM_RBUTTONDOWN, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
+    GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, IsWindowVisible, LoadCursorW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow, TranslateMessage,
+    UnregisterClassW, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
+    WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
+use crate::compose::{analyze, center_pixel, compose, has_content, Compose, Scaler};
 use crate::readback::{PixelFormat, Readback};
+use crate::throttle::Throttle;
 use crate::input::HOST_HWND;
 use crate::receiver::RECEIVER_NAME;
 use crate::EDIT_HANDLE;
@@ -51,6 +59,8 @@ use crate::EDIT_HANDLE;
 const WM_APP_SHOW: u32 = WM_APP + 1;
 const WM_APP_HIDE: u32 = WM_APP + 2;
 const WM_APP_QUIT: u32 = WM_APP + 3;
+/// 前面のアプリが本体（このプロセス）か、ほかのアプリかが変わった。wparam = 1 なら本体、lparam = 前面のウィンドウ
+const WM_APP_FOREGROUND: u32 = WM_APP + 4;
 
 /// ウィンドウクラスの名前。この DLL の HINSTANCE で登録し、`shutdown` で外す
 const CLASS_NAME: PCWSTR = w!("FullSizePreview_H_Window");
@@ -68,6 +78,17 @@ const QUEUE_MAX_AGE: Duration = Duration::from_millis(2000);
 const PAST_WINDOW_SEC: f64 = 3.0;
 /// 最初からこの枚数続けて空（全画素 0）なら、受け口がカメラ制御の対象になっているとみて案内する
 const EMPTY_FRAMES_BEFORE_NOTICE: u32 = 8;
+/// 使い終わった画素バッファを取っておく上限（枚数と合計バイト）。4K（1 枚 33MB）なら 2 枚
+const POOL_MAX_FRAMES: usize = 8;
+const POOL_MAX_BYTES: usize = 96 * 1024 * 1024;
+/// 再生中のカーソルの移動（シーク）を見る間隔。`get_edit_info` は本体の参照ロックを取るので、毎フレームは呼ばない
+const EDIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// 表示スレッドが一度に眠る上限（前面のアプリの確かめもこの間隔）
+const MAX_WAIT: Duration = Duration::from_millis(50);
+/// 止めるときに表示スレッドの終わりを待つ上限。超えたら待たずに戻り、`shutdown` で待つ
+const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// 再生中のカーソルの移動を INFO で出す回数（再生 1 回あたり。以後は閉じたときの集計だけ）
+const REANCHOR_LOG_MAX: u32 = 3;
 
 /// 再生位置の見積もり。
 #[derive(Clone, Debug)]
@@ -83,6 +104,17 @@ struct Clock {
 }
 
 impl Clock {
+    /// `now` の次に再生位置が 1 つ進む時刻
+    fn next_change(&self, now: Instant) -> Instant {
+        if self.frames_per_sec <= 0.0 {
+            return now + MAX_WAIT;
+        }
+        let elapsed = now.saturating_duration_since(self.anchor_at).as_secs_f64();
+        let next = ((elapsed * self.frames_per_sec).floor() + 1.0) / self.frames_per_sec;
+        // 浮動小数の丸めで境目の手前に落ちないよう、少しだけ後ろにする
+        self.anchor_at + Duration::from_secs_f64(next) + Duration::from_micros(10)
+    }
+
     fn frame_at(&self, now: Instant) -> usize {
         let elapsed = now.saturating_duration_since(self.anchor_at).as_secs_f64();
         let raw = self.anchor_frame + (elapsed * self.frames_per_sec).floor() as usize;
@@ -112,7 +144,6 @@ struct Frame {
     bgra: Vec<u8>,
 }
 
-#[derive(Default)]
 struct Stats {
     received: u64,
     shown: u64,
@@ -120,10 +151,41 @@ struct Stats {
     lead_sum: f64,
     lead_min: i64,
     lead_max: i64,
-    /// 受け口での読み出し（GPU → CPU）にかかった時間
+    /// 受け口での読み出し（GPU → CPU）にかかった時間。内訳は写す（`copy_image_resource`）と取り出す（`get_image_resource_data`）
     readback_ms_sum: f64,
     readback_ms_max: f64,
+    copy_ms_sum: f64,
+    data_ms_sum: f64,
+    data_ms_max: f64,
     receivers: Vec<i64>,
+    /// 表示スレッドの `get_edit_info`（本体の参照ロック）
+    edit_info_calls: u64,
+    edit_info_ms_sum: f64,
+    edit_info_ms_max: f64,
+    /// 再生中にカーソルが動いて数え直した回数
+    reanchors: u32,
+}
+
+impl Stats {
+    const fn new() -> Self {
+        Self {
+            received: 0,
+            shown: 0,
+            lead_sum: 0.0,
+            lead_min: 0,
+            lead_max: 0,
+            readback_ms_sum: 0.0,
+            readback_ms_max: 0.0,
+            copy_ms_sum: 0.0,
+            data_ms_sum: 0.0,
+            data_ms_max: 0.0,
+            receivers: Vec::new(),
+            edit_info_calls: 0,
+            edit_info_ms_sum: 0.0,
+            edit_info_ms_max: 0.0,
+            reanchors: 0,
+        }
+    }
 }
 
 /// ウィンドウのスレッドと `shutdown` の受け渡し。
@@ -216,6 +278,16 @@ impl Workers {
         }
     }
 
+    /// 待ちきれなかったスレッドを預かる（`close_and_join` で待つ）。閉じた後なら返す
+    fn adopt(&self, handle: JoinHandle<()>) -> Result<(), JoinHandle<()>> {
+        let mut handles = self.handles.lock();
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(handle);
+        }
+        handles.push(handle);
+        Ok(())
+    }
+
     /// 閉じて（以後は起こさない）、起こしたスレッドが終わるのを `deadline` まで待つ。待ちきれなかった本数を返す
     fn close_and_join(&self, deadline: Instant) -> usize {
         let handles = {
@@ -223,7 +295,7 @@ impl Workers {
             self.closed.store(true, Ordering::SeqCst);
             std::mem::take(&mut *handles)
         };
-        handles.into_iter().map(|h| join_until(h, deadline)).filter(|done| !done).count()
+        handles.into_iter().filter_map(|h| join_until(h, deadline)).count()
     }
 
     #[cfg(test)]
@@ -232,23 +304,23 @@ impl Workers {
     }
 }
 
-/// `deadline` まで終わりを待ち、終わったら join して true。間に合わなければ false（handle は手放す）
-fn join_until(handle: JoinHandle<()>, deadline: Instant) -> bool {
+/// `deadline` まで終わりを待ち、終わったら join して None。間に合わなければ handle を返す
+fn join_until(handle: JoinHandle<()>, deadline: Instant) -> Option<JoinHandle<()>> {
     while !handle.is_finished() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(5));
     }
     if handle.is_finished() {
         let _ = handle.join();
-        true
+        None
     } else {
-        false
+        Some(handle)
     }
 }
 
 struct Preview {
     window: WindowSlot,
     window_thread: Mutex<Option<JoinHandle<()>>>,
-    /// クリック・WM_CLOSE で閉じるために起こしたスレッド（`shutdown` で待つ）
+    /// クリック・WM_CLOSE で閉じるために起こしたスレッドと、止めるときに待ちきれなかった表示スレッド（`shutdown` で待つ）
     stoppers: Workers,
     display_thread: Mutex<Option<JoinHandle<()>>>,
     /// 表示中のセッション番号（0 = 閉じている）。開くたびに増える
@@ -256,8 +328,12 @@ struct Preview {
     next_session: AtomicU64,
     clock: Mutex<Option<Clock>>,
     queue: Mutex<VecDeque<Incoming>>,
-    /// 使い終わった画素バッファ（受け口で毎フレーム 8MB を確保し直さないため）
+    /// 新しい 1 枚が届いた・止まった（表示スレッドを起こす。`queue` のロックと組で使う）
+    arrived: Condvar,
+    /// 使い終わった画素バッファ（受け口で毎フレーム 8MB を確保し直さないため）。閉じたら手放す
     pool: Mutex<Vec<Vec<u8>>>,
+    /// 受け口の読み出しの間引き（開いている間だけ）
+    throttle: Mutex<Option<Throttle>>,
     frame: Mutex<Option<Arc<Frame>>>,
     status: Mutex<String>,
     stats: Mutex<Stats>,
@@ -279,19 +355,12 @@ static PREVIEW: Preview = Preview {
     next_session: AtomicU64::new(0),
     clock: Mutex::new(None),
     queue: Mutex::new(VecDeque::new()),
+    arrived: Condvar::new(),
     pool: Mutex::new(Vec::new()),
+    throttle: Mutex::new(None),
     frame: Mutex::new(None),
     status: Mutex::new(String::new()),
-    stats: Mutex::new(Stats {
-        received: 0,
-        shown: 0,
-        lead_sum: 0.0,
-        lead_min: 0,
-        lead_max: 0,
-        readback_ms_sum: 0.0,
-        readback_ms_max: 0.0,
-        receivers: Vec::new(),
-    }),
+    stats: Mutex::new(Stats::new()),
     started_at: Mutex::new(None),
     scene_size: Mutex::new((0, 0)),
     background: Mutex::new([0, 0, 0]),
@@ -320,14 +389,37 @@ pub fn is_open() -> bool {
     PREVIEW.session.load(Ordering::Acquire) != 0
 }
 
-/// 受け口が画像を読み出すべきか（空白キーで再生している間だけ）。
-pub fn wants_frames() -> bool {
-    is_open()
+/// 受け口が呼ばれるたびに呼ぶ（本体の描画スレッド）。この回に画像を読み出すか
+/// （空白キーで再生している間だけ。本体が追いつかないときは間引く）。
+pub fn should_read(now: Instant) -> bool {
+    if !is_open() {
+        return false;
+    }
+    let (read, notice) = match PREVIEW.throttle.lock().as_mut() {
+        Some(t) => (t.on_call(now), t.take_notice()),
+        None => (true, None),
+    };
+    if let Some(n) = notice {
+        tracing::info!(
+            "FullSizePreview_H: 本体が再生に追いついていないため（受け口の呼ばれる間隔 平均 {:.1}ms / 1 フレーム {:.1}ms、読み出し 平均 {:.1}ms）、読み出しを {} フレームに 1 回へ間引きます（本体の様子を見て最大 {} フレームに 1 回まで広げ、追いつけば戻します。この再生では以後出しません）",
+            n.interval_ms,
+            n.period_ms,
+            n.cost_ms,
+            n.every,
+            crate::throttle::MAX_EVERY
+        );
+    }
+    read
 }
 
+/// 使い終わったバッファを取っておく（開いている間だけ。枚数とバイト数の上限まで）。
 fn recycle(buffer: Vec<u8>) {
+    if !is_open() || buffer.capacity() == 0 {
+        return;
+    }
     let mut pool = PREVIEW.pool.lock();
-    if pool.len() < 8 {
+    let bytes: usize = pool.iter().map(|b| b.capacity()).sum();
+    if pool.len() < POOL_MAX_FRAMES && bytes + buffer.capacity() <= POOL_MAX_BYTES {
         pool.push(buffer);
     }
 }
@@ -337,19 +429,23 @@ pub fn take_buffer() -> Vec<u8> {
     PREVIEW.pool.lock().pop().unwrap_or_default()
 }
 
-/// 読み出しに失敗したバッファを返す。
+/// 使わなかったバッファを返す（読み出しに失敗した・ビデオスコープのためだけに読んだ）。
 pub fn give_back(buffer: Vec<u8>) {
     recycle(buffer);
 }
 
 /// 受け口（本体の描画スレッド）から呼ぶ。読み出したフレームを溜めておく。
-pub fn push(effect_id: i64, frame: usize, rb: Readback, raw: Vec<u8>, readback: Duration) {
+pub fn push(effect_id: i64, frame: usize, rb: Readback, raw: Vec<u8>) {
     if !is_open() || rb.width == 0 || rb.height == 0 {
         recycle(raw);
         return;
     }
-    let readback_ms = readback.as_secs_f64() * 1000.0;
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let readback_ms = ms(rb.total());
     let arrived = Instant::now();
+    if let Some(t) = PREVIEW.throttle.lock().as_mut() {
+        t.on_read(readback_ms, arrived);
+    }
 
     let target = PREVIEW.clock.lock().as_ref().map(|c| c.frame_at(arrived));
     {
@@ -357,6 +453,9 @@ pub fn push(effect_id: i64, frame: usize, rb: Readback, raw: Vec<u8>, readback: 
         stats.received += 1;
         stats.readback_ms_sum += readback_ms;
         stats.readback_ms_max = stats.readback_ms_max.max(readback_ms);
+        stats.copy_ms_sum += ms(rb.copy);
+        stats.data_ms_sum += ms(rb.data);
+        stats.data_ms_max = stats.data_ms_max.max(ms(rb.data));
         if let Some(t) = target {
             let lead = frame as i64 - t as i64;
             if stats.received == 1 {
@@ -383,6 +482,8 @@ pub fn push(effect_id: i64, frame: usize, rb: Readback, raw: Vec<u8>, readback: 
         bytes -= old.raw.len();
         recycle(old.raw);
     }
+    drop(queue);
+    PREVIEW.arrived.notify_one();
 }
 
 /// 溜めたフレームから、再生位置 `target` に出すものを選ぶ。
@@ -484,10 +585,11 @@ pub fn start() {
     let session = PREVIEW.next_session.fetch_add(1, Ordering::AcqRel) + 1;
     *PREVIEW.frame.lock() = None;
     *PREVIEW.status.lock() = String::new();
-    *PREVIEW.stats.lock() = Stats::default();
+    *PREVIEW.stats.lock() = Stats::new();
     *PREVIEW.started_at.lock() = Some(started);
     *PREVIEW.scene_size.lock() = (info.width as i32, info.height as i32);
     *PREVIEW.background.lock() = info.background.map(|(r, g, b)| [r, g, b]).unwrap_or([0, 0, 0]);
+    *PREVIEW.throttle.lock() = Some(Throttle::new(clock.frames_per_sec));
     *PREVIEW.clock.lock() = Some(clock);
     PREVIEW.session.store(session, Ordering::Release);
     let _ = h;
@@ -506,22 +608,45 @@ pub fn stop() {
     stop_locked();
 }
 
+/// 止める。表示スレッドが `STOP_JOIN_TIMEOUT` で終わらなければ、待たずに預けて戻る（`shutdown` で待つ）。
+///
+/// 表示スレッドは眠っていても `arrived` で起こすので、ふつうはすぐ終わる。長く待たされうるのは
+/// 本体の `get_edit_info`（参照ロック）の中にいるときだけ（0.1 秒に 1 回しか呼ばない）
 fn stop_locked() {
+    if let Some(t) = stop_display(Instant::now() + STOP_JOIN_TIMEOUT) {
+        tracing::warn!(
+            "FullSizePreview_H: 表示スレッドが {} 秒以内に止まりませんでした（待たずに続け、終了時に待ちます）",
+            STOP_JOIN_TIMEOUT.as_secs()
+        );
+        if PREVIEW.stoppers.adopt(t).is_err() {
+            tracing::warn!("FullSizePreview_H: 終了の処理に入っているため、表示スレッドを待てません");
+        }
+    }
+}
+
+/// 表示を止めて片付け、閉じたときの集計を出す。表示スレッドが `deadline` までに終わらなければ、その handle を返す
+fn stop_display(deadline: Instant) -> Option<JoinHandle<()>> {
     let session = PREVIEW.session.swap(0, Ordering::AcqRel);
+    {
+        // 表示スレッドは `queue` のロックの中で印を見てから眠るので、ロックを取ってから起こせば取りこぼさない
+        let _queue = PREVIEW.queue.lock();
+        PREVIEW.arrived.notify_all();
+    }
     if let Some(h) = hwnd() {
         unsafe {
             let _ = PostMessageW(Some(h), WM_APP_HIDE, WPARAM(0), LPARAM(0));
         }
     }
-    if let Some(t) = PREVIEW.display_thread.lock().take() {
-        let _ = t.join();
-    }
+    let display = PREVIEW.display_thread.lock().take();
+    let straggler = display.and_then(|t| join_until(t, deadline));
     *PREVIEW.clock.lock() = None;
-    for q in PREVIEW.queue.lock().drain(..) {
-        recycle(q.raw);
-    }
+    // 溜めたフレーム・使い回しのバッファ・最後の 1 枚を手放す（4K では合わせて数百 MB になる）
+    PREVIEW.queue.lock().clear();
+    PREVIEW.pool.lock().clear();
+    *PREVIEW.frame.lock() = None;
+    let throttle = PREVIEW.throttle.lock().take();
     if session == 0 {
-        return;
+        return straggler;
     }
     let elapsed = PREVIEW
         .started_at
@@ -532,23 +657,35 @@ fn stop_locked() {
     let stats = PREVIEW.stats.lock();
     if stats.received == 0 {
         tracing::debug!("FullSizePreview_H: {RECEIVER_NAME}が無いため開きませんでした");
-        return;
+        return straggler;
     }
     let per_sec = |n: u64| if elapsed > 0.0 { n as f64 / elapsed } else { 0.0 };
     let avg = |sum: f64| if stats.received > 0 { sum / stats.received as f64 } else { 0.0 };
+    let (skipped, max_every) = throttle.map(|t| (t.skipped, t.max_every)).unwrap_or((0, 1));
+    let edit_avg = if stats.edit_info_calls > 0 { stats.edit_info_ms_sum / stats.edit_info_calls as f64 } else { 0.0 };
     tracing::info!(
-        "FullSizePreview_H: 閉じました。{elapsed:.1} 秒 / 受け取り {} 枚（{:.1} fps）/ 表示 {} 枚（{:.1} fps）/ 読み出し 平均 {:.1}ms 最大 {:.1}ms / 再生位置との差 平均 {:.1} 最小 {} 最大 {} フレーム / 受け口 {} 個",
+        "FullSizePreview_H: 閉じました。{elapsed:.1} 秒 / 受け取り {} 枚（{:.1} fps）/ 表示 {} 枚（{:.1} fps）/ 読み出し 平均 {:.1}ms 最大 {:.1}ms（写す 平均 {:.1}ms・取り出す 平均 {:.1}ms 最大 {:.1}ms）/ 間引き {} 回（最大 {} フレームに 1 回）/ get_edit_info {} 回 平均 {:.2}ms 最大 {:.2}ms / カーソルの移動 {} 回 / 再生位置との差 平均 {:.1} 最小 {} 最大 {} フレーム / 受け口 {} 個",
         stats.received,
         per_sec(stats.received),
         stats.shown,
         per_sec(stats.shown),
         avg(stats.readback_ms_sum),
         stats.readback_ms_max,
+        avg(stats.copy_ms_sum),
+        avg(stats.data_ms_sum),
+        stats.data_ms_max,
+        skipped,
+        max_every,
+        stats.edit_info_calls,
+        edit_avg,
+        stats.edit_info_ms_max,
+        stats.reanchors,
         avg(stats.lead_sum),
         stats.lead_min,
         stats.lead_max,
         stats.receivers.len()
     );
+    straggler
 }
 
 /// ウィンドウのクリック・WM_CLOSE から呼ぶ。閉じる処理（描画スレッドの join を含む）を別のスレッドで行う。
@@ -567,8 +704,15 @@ pub fn shutdown() {
     let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
     // 1. クリックで起こした「閉じる」スレッドを待つ（以後は起こさない）
     let mut left = PREVIEW.stoppers.close_and_join(deadline);
-    // 2. 表示を止める（描画スレッドを join する）
-    stop();
+    // 2. 表示を止める（描画スレッドを join する）。「閉じる」スレッドが止まらずに印を持ったままなら、待たずに進む
+    match PREVIEW.control.try_lock_until(deadline) {
+        Some(_control) => {
+            if stop_display(deadline).is_some() {
+                left += 1;
+            }
+        }
+        None => left += 1,
+    }
     // 3. ウィンドウのスレッドを止める。生成が時間切れの後に遅れてできた場合も、終了の印を見て自分で抜ける
     if let Some(h) = PREVIEW.window.request_quit() {
         unsafe {
@@ -576,7 +720,7 @@ pub fn shutdown() {
         }
     }
     let window_done = match PREVIEW.window_thread.lock().take() {
-        Some(t) => join_until(t, deadline),
+        Some(t) => join_until(t, deadline).is_none(),
         None => true,
     };
     if window_done {
@@ -628,30 +772,103 @@ fn pin_module() {
     }
 }
 
+/// 表示スレッドの作業場所（1 枚ごとに確保し直さない）
+struct Workspace {
+    scaler: Scaler,
+    /// 次の 1 枚を書く BGRA。前に出した 1 枚を描き終わっていれば、そのバッファを使い回す
+    spare: Vec<u8>,
+}
+
+/// 表示する大きさ（ウィンドウの大きさ）。ウィンドウのスレッドと同じ DPI の扱いで数える
+fn display_size(scene: (i32, i32)) -> (usize, usize) {
+    let (w, h) = match target_monitor_rect() {
+        Some(m) => {
+            let r = window_rect(m, scene);
+            (r.right - r.left, r.bottom - r.top)
+        }
+        None => scene,
+    };
+    (w.max(0) as usize, h.max(0) as usize)
+}
+
+/// 前面のウィンドウがこのプロセス（本体）のものか。前面が無い（切り替えの途中）なら None
+fn foreground_is_ours() -> Option<(bool, HWND)> {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        Some((pid == GetCurrentProcessId(), fg))
+    }
+}
+
 /// 再生位置が変わるたびに、溜めたフレームから合うものを選んで出す。
+///
+/// 次のフレームの時刻・新しい 1 枚が届く・止める、のどれかまで眠る（v0.6.0 までは 1ms ごとに起きて
+/// `get_edit_info` を呼んでいた）。シークを見る `get_edit_info` は `EDIT_POLL_INTERVAL` に 1 回
 fn display_loop(session: u64) {
+    // ウィンドウのスレッドと同じく実ピクセルで数える（ウィンドウの大きさに縮めるため）
+    unsafe {
+        let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
     let Some(mut clock) = PREVIEW.clock.lock().clone() else {
         return;
     };
     let past_window = (clock.frames_per_sec * PAST_WINDOW_SEC).ceil() as usize;
+    let view = display_size(*PREVIEW.scene_size.lock());
     // 再生中に本体のカーソルが動いたら（シーク等）、そこから数え直す
     let mut cursor = clock.anchor_frame;
+    let mut next_edit_poll = Instant::now() + EDIT_POLL_INTERVAL;
     let mut shown: Option<usize> = None;
-    let mut compose = Compose { background: *PREVIEW.background.lock(), ignore_alpha: false };
-    let mut premul: Vec<u8> = Vec::new();
+    let mut compose_with = Compose { background: *PREVIEW.background.lock(), ignore_alpha: false };
+    let mut work = Workspace { scaler: Scaler::default(), spare: Vec::new() };
     // 空でない 1 枚が来るまで、届いた画像が空かどうかを調べる
     let mut saw_content = false;
     let mut empty_frames: u32 = 0;
+    // 再生は本体で空白キーを押して始まるので、前面は本体
+    let mut ours_in_front = true;
 
     while PREVIEW.session.load(Ordering::Acquire) == session {
         let now = Instant::now();
-        let edit_frame = EDIT_HANDLE.get_edit_info().frame;
-        if edit_frame != cursor {
-            tracing::info!("FullSizePreview_H: 再生中にカーソルが {cursor} から {edit_frame} へ動いたので、そこから数え直します");
-            cursor = edit_frame;
-            clock.anchor_frame = edit_frame;
-            clock.anchor_at = now;
-            *PREVIEW.clock.lock() = Some(clock.clone());
+        if now >= next_edit_poll {
+            next_edit_poll = now + EDIT_POLL_INTERVAL;
+            let t0 = Instant::now();
+            let edit_frame = EDIT_HANDLE.get_edit_info().frame;
+            let took = t0.elapsed().as_secs_f64() * 1000.0;
+            let reanchors = {
+                let mut stats = PREVIEW.stats.lock();
+                stats.edit_info_calls += 1;
+                stats.edit_info_ms_sum += took;
+                stats.edit_info_ms_max = stats.edit_info_ms_max.max(took);
+                if edit_frame != cursor {
+                    stats.reanchors += 1;
+                }
+                stats.reanchors
+            };
+            if edit_frame != cursor {
+                if reanchors <= REANCHOR_LOG_MAX {
+                    tracing::info!(
+                        "FullSizePreview_H: 再生中にカーソルが {cursor} から {edit_frame} へ動いたので、そこから数え直します{}",
+                        if reanchors == REANCHOR_LOG_MAX { "（この再生では以後、閉じたときの集計にだけ出します）" } else { "" }
+                    );
+                }
+                cursor = edit_frame;
+                clock.anchor_frame = edit_frame;
+                clock.anchor_at = now;
+                *PREVIEW.clock.lock() = Some(clock.clone());
+            }
+        }
+        if let Some((ours, fg)) = foreground_is_ours() {
+            if ours != ours_in_front {
+                ours_in_front = ours;
+                if let Some(h) = hwnd() {
+                    unsafe {
+                        let _ = PostMessageW(Some(h), WM_APP_FOREGROUND, WPARAM(ours as usize), LPARAM(fg.0 as isize));
+                    }
+                }
+            }
         }
         let target = clock.frame_at(now);
 
@@ -682,159 +899,104 @@ fn display_loop(session: u64) {
                     }
                     chosen
                 }
-                _ => None,
+                _ => {
+                    // 出すものが無い。次のフレームの時刻・新しい 1 枚・止める・シークを見る時刻のどれかまで眠る。
+                    // 止める側は印を下ろしてから、このロックを取って起こすので、印はロックの中で見る
+                    if PREVIEW.session.load(Ordering::Acquire) == session {
+                        let until = clock.next_change(now).min(now + MAX_WAIT).min(next_edit_poll);
+                        let _ = PREVIEW.arrived.wait_until(&mut queue, until);
+                    }
+                    None
+                }
             }
         };
 
-        if let Some(c) = chosen {
-            to_premul_rgba8(&c.raw, c.width, c.height, c.format, &mut premul);
+        let Some(c) = chosen else { continue };
+        if !saw_content {
+            if has_content(&c.raw) {
+                saw_content = true;
+                if empty_frames >= EMPTY_FRAMES_BEFORE_NOTICE {
+                    if let Some(t) = PREVIEW.throttle.lock().as_mut() {
+                        t.set_idle(false);
+                    }
+                }
+            } else {
+                empty_frames += 1;
+                if empty_frames == EMPTY_FRAMES_BEFORE_NOTICE {
+                    // カメラ制御の対象の中では、受け口に届くのは合成前の空のバッファ（実機 2026-09-27）
+                    tracing::warn!("FullSizePreview_H: {RECEIVER_NAME}に届く画像が {empty_frames} 枚続けて空です。受け口がカメラ制御の対象になっていないか確かめてください");
+                    *PREVIEW.frame.lock() = None;
+                    // 空の間は読み出しを 0.5 秒に 1 回へ（本体の描画スレッドで読む分を減らす）
+                    if let Some(t) = PREVIEW.throttle.lock().as_mut() {
+                        t.set_idle(true);
+                    }
+                    set_status(format!(
+                        "{RECEIVER_NAME}に届く画像が空です。受け口がカメラ制御の対象になっていると画面が届きません。受け口を選んで、設定欄の「カメラ制御の対象」を外してください。編集メニュー「フルサイズプレビュー受け口を置く」でも外せます（クリックで閉じます）"
+                    ));
+                }
+                if empty_frames >= EMPTY_FRAMES_BEFORE_NOTICE {
+                    // 案内を出したまま、空の画像では上書きしない
+                    recycle(c.raw);
+                    continue;
+                }
+            }
+        }
+        if shown.is_none() {
+            let px = analyze(&c.raw);
+            // αが全面 0 なのに色がある場合は、αを当てにせず不透明として出す
+            compose_with.ignore_alpha = px.alpha_max == 0 && px.rgb_max > 0;
+            tracing::info!(
+                "FullSizePreview_H: 最初の 1 枚（フレーム {} / {}x{} / {:?} / 表示 {}x{}）: α 最小 {} 最大 {} 平均 {:.1} / 色の最大 {} / 色のある画素 {} / 中央の画素 {:?} / 背景色 {:?} / αを無視: {}",
+                c.frame,
+                c.width,
+                c.height,
+                c.format,
+                view.0,
+                view.1,
+                px.alpha_min,
+                px.alpha_max,
+                px.alpha_mean,
+                px.rgb_max,
+                px.colored,
+                center_pixel(&c.raw, c.width, c.height),
+                compose_with.background,
+                compose_with.ignore_alpha
+            );
+        }
+        let (w, h) = (c.width as usize, c.height as usize);
+        let mut bgra = std::mem::take(&mut work.spare);
+        if compose(&c.raw, (w, h), view, &compose_with, &mut work.scaler, &mut bgra) {
+            let (fw, fh) = if view.0 > 0 && view.1 > 0 && view.0 <= w && view.1 <= h { view } else { (w, h) };
+            let frame = Arc::new(Frame { width: fw as i32, height: fh as i32, bgra });
+            let old = {
+                let mut slot = PREVIEW.frame.lock();
+                // 止められた後は出さない（次の再生の 1 枚を上書きしない）
+                if PREVIEW.session.load(Ordering::Acquire) != session {
+                    recycle(c.raw);
+                    break;
+                }
+                slot.replace(frame)
+            };
+            // 描き終わっていれば（ウィンドウのスレッドが持っていなければ）、次の 1 枚に使い回す
+            if let Some(old) = old.and_then(|f| Arc::try_unwrap(f).ok()) {
+                work.spare = old.bgra;
+            }
+            PREVIEW.stats.lock().shown += 1;
             if shown.is_none() {
-                let px = analyze(&premul);
-                // αが全面 0 なのに色がある場合は、αを当てにせず不透明として出す
-                compose.ignore_alpha = px.alpha_max == 0 && px.rgb_max > 0;
-                tracing::info!(
-                    "FullSizePreview_H: 最初の 1 枚（フレーム {} / {}x{} / {:?}）: α 最小 {} 最大 {} 平均 {:.1} / 色の最大 {} / 色のある画素 {} / 中央の画素 {:?} / 背景色 {:?} / αを無視: {}",
-                    c.frame,
-                    c.width,
-                    c.height,
-                    c.format,
-                    px.alpha_min,
-                    px.alpha_max,
-                    px.alpha_mean,
-                    px.rgb_max,
-                    px.colored,
-                    center_pixel(&premul, c.width, c.height),
-                    compose.background,
-                    compose.ignore_alpha
-                );
-            }
-            if !saw_content {
-                let px = analyze(&premul);
-                if px.alpha_max > 0 || px.rgb_max > 0 {
-                    saw_content = true;
-                } else {
-                    empty_frames += 1;
-                    if empty_frames == EMPTY_FRAMES_BEFORE_NOTICE {
-                        // カメラ制御の対象の中では、受け口に届くのは合成前の空のバッファ（実機 2026-09-27）
-                        tracing::warn!("FullSizePreview_H: {RECEIVER_NAME}に届く画像が {empty_frames} 枚続けて空です。受け口がカメラ制御の対象になっていないか確かめてください");
-                        *PREVIEW.frame.lock() = None;
-                        set_status(format!(
-                            "{RECEIVER_NAME}に届く画像が空です。受け口がカメラ制御の対象になっていると画面が届きません。受け口を選んで、設定欄の「カメラ制御の対象」を外してください。編集メニュー「フルサイズプレビュー受け口を置く」でも外せます（クリックで閉じます）"
-                        ));
-                    }
-                    if empty_frames >= EMPTY_FRAMES_BEFORE_NOTICE {
-                        // 案内を出したまま、空の画像では上書きしない
-                        recycle(c.raw);
-                        std::thread::sleep(Duration::from_millis(1));
-                        continue;
+                // 最初の 1 枚が用意できてから出す（受け口の無いシーンでは出さない）
+                if let Some(h) = hwnd() {
+                    unsafe {
+                        let _ = PostMessageW(Some(h), WM_APP_SHOW, WPARAM(0), LPARAM(0));
                     }
                 }
             }
-            if let Some(f) = composite(&premul, c.width, c.height, &compose) {
-                *PREVIEW.frame.lock() = Some(Arc::new(f));
-                PREVIEW.stats.lock().shown += 1;
-                if shown.is_none() {
-                    // 最初の 1 枚が用意できてから出す（受け口の無いシーンでは出さない）
-                    if let Some(h) = hwnd() {
-                        unsafe {
-                            let _ = PostMessageW(Some(h), WM_APP_SHOW, WPARAM(0), LPARAM(0));
-                        }
-                    }
-                }
-                shown = Some(c.frame);
-                invalidate();
-            }
-            recycle(c.raw);
+            shown = Some(c.frame);
+            invalidate();
+        } else {
+            work.spare = bgra;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        recycle(c.raw);
     }
-}
-
-/// 合成の仕方。
-struct Compose {
-    /// 透明部分に敷く色（R,G,B）
-    background: [u8; 3],
-    /// αを無視して不透明として出す
-    ignore_alpha: bool,
-}
-
-/// 届いた画素の統計（切り分け用にログへ出す）。
-struct PixelStats {
-    alpha_min: u8,
-    alpha_max: u8,
-    alpha_mean: f64,
-    rgb_max: u8,
-    /// R,G,B のどれかが 0 でない画素の数
-    colored: usize,
-}
-
-fn analyze(rgba: &[u8]) -> PixelStats {
-    let mut st = PixelStats { alpha_min: 255, alpha_max: 0, alpha_mean: 0.0, rgb_max: 0, colored: 0 };
-    let mut sum: u64 = 0;
-    let mut n: u64 = 0;
-    for p in rgba.chunks_exact(4) {
-        st.alpha_min = st.alpha_min.min(p[3]);
-        st.alpha_max = st.alpha_max.max(p[3]);
-        sum += p[3] as u64;
-        n += 1;
-        let m = p[0].max(p[1]).max(p[2]);
-        st.rgb_max = st.rgb_max.max(m);
-        if m > 0 {
-            st.colored += 1;
-        }
-    }
-    if n == 0 {
-        st.alpha_min = 0;
-    } else {
-        st.alpha_mean = sum as f64 / n as f64;
-    }
-    st
-}
-
-fn center_pixel(rgba: &[u8], width: u32, height: u32) -> [u8; 4] {
-    let i = ((height as usize / 2) * width as usize + width as usize / 2) * 4;
-    rgba.get(i..i + 4).map(|p| [p[0], p[1], p[2], p[3]]).unwrap_or_default()
-}
-
-/// 読み出した画素を、乗算済みの R,G,B,A（各 8bit）へ。
-fn to_premul_rgba8(raw: &[u8], width: u32, height: u32, format: PixelFormat, out: &mut Vec<u8>) {
-    let n = width as usize * height as usize;
-    out.resize(n * 4, 0);
-    let raw = &raw[..(n * format.bytes_per_pixel()).min(raw.len())];
-    match format {
-        PixelFormat::RgbaStraight8 => {
-            for (s, d) in raw.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
-                let a = s[3] as u32;
-                if a == 255 {
-                    d.copy_from_slice(s);
-                } else {
-                    d[0] = ((s[0] as u32 * a + 127) / 255) as u8;
-                    d[1] = ((s[1] as u32 * a + 127) / 255) as u8;
-                    d[2] = ((s[2] as u32 * a + 127) / 255) as u8;
-                    d[3] = s[3];
-                }
-            }
-        }
-    }
-}
-
-/// 乗算済みの R,G,B,A（各 8bit）を、背景色の上に合成した BGRA へ。
-fn composite(premul: &[u8], width: u32, height: u32, compose: &Compose) -> Option<Frame> {
-    let n = width as usize * height as usize;
-    if n == 0 || premul.len() < n * 4 {
-        return None;
-    }
-    let mut bgra = vec![0u8; n * 4];
-    let [br, bg, bb] = compose.background;
-    for (s, d) in premul.chunks_exact(4).zip(bgra.chunks_exact_mut(4)) {
-        let rest = if compose.ignore_alpha { 0 } else { 255 - s[3] as u32 };
-        let over = |c: u8, back: u8| (c as u32 + (back as u32 * rest + 127) / 255).min(255) as u8;
-        d[0] = over(s[2], bb);
-        d[1] = over(s[1], bg);
-        d[2] = over(s[0], br);
-        d[3] = 255;
-    }
-    Some(Frame { width: width as i32, height: height as i32, bgra })
 }
 
 // ---- ウィンドウ ----
@@ -961,6 +1123,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             LRESULT(0)
         }
+        WM_APP_FOREGROUND => {
+            // 本体以外のアプリが前に出たら、最前面をやめてそのアプリのすぐ後ろへ下がる（Alt+Tab で移った先を覆わない）。
+            // 本体へ戻ったら最前面に戻す。どちらもフォーカスは取らない
+            unsafe {
+                if IsWindowVisible(hwnd).as_bool() {
+                    let after = if wparam.0 != 0 { HWND_TOPMOST } else { HWND(lparam.0 as _) };
+                    let _ = SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+                }
+            }
+            LRESULT(0)
+        }
         WM_APP_QUIT => {
             unsafe {
                 let _ = DestroyWindow(hwnd);
@@ -1036,8 +1209,9 @@ unsafe fn paint(hwnd: HWND) {
             };
             unsafe {
                 if dw != f.width {
-                    SetStretchBltMode(hdc, HALFTONE);
-                    let _ = SetBrushOrgEx(hdc, 0, 0, None);
+                    // ふつうは表示スレッドがウィンドウの大きさに縮めてある（等倍で描く）。ずれたときだけここで縮める。
+                    // HALFTONE は 4K→FHD で 1 枚 32ms かかるので使わない（机上 `cost_tests.rs`。COLORONCOLOR は 2.5ms）
+                    SetStretchBltMode(hdc, COLORONCOLOR);
                 }
                 StretchDIBits(
                     hdc,
@@ -1078,43 +1252,67 @@ unsafe fn paint(hwnd: HWND) {
     }
 }
 
+/// 机上で測るテスト（`cost_tests.rs`）から呼ぶ入口。
+#[cfg(test)]
+pub(crate) mod bench {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct State {
+        scaler: Scaler,
+        out: Vec<u8>,
+    }
+
+    /// 表示スレッドが 1 枚ごとに行う変換と合成（`display` はウィンドウの大きさ）
+    pub fn convert(state: &mut State, raw: &[u8], width: u32, height: u32, display: (usize, usize)) {
+        let c = Compose { background: [3, 0, 46], ignore_alpha: false };
+        let ok = compose(raw, (width as usize, height as usize), display, &c, &mut state.scaler, &mut state.out);
+        assert!(ok);
+        std::hint::black_box(&state.out);
+    }
+
+    pub fn read_player_config_at(path: &std::path::Path) -> crate::settings::PlayerConfig {
+        crate::settings::read_player_config_at(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn ignores_alpha_when_alpha_is_all_zero() {
-        let st = analyze(&[200, 100, 50, 0, 0, 0, 0, 0]);
-        assert_eq!((st.alpha_max, st.rgb_max, st.colored), (0, 200, 1));
-        let opaque = Compose { background: [3, 0, 46], ignore_alpha: true };
-        let f = composite(&[200, 100, 50, 0], 1, 1, &opaque).unwrap();
-        assert_eq!(&f.bgra[..], &[50, 100, 200, 255]);
+    fn next_change_is_the_next_frame_boundary() {
+        let t0 = Instant::now();
+        let clock = Clock { anchor_frame: 0, anchor_at: t0, frames_per_sec: 30.0, loop_start: 0, loop_end: 0 };
+        let next = clock.next_change(t0 + Duration::from_millis(10));
+        assert!(((next - t0).as_secs_f64() - 1.0 / 30.0).abs() < 1e-4);
+        assert_eq!(clock.frame_at(next), 1);
+        // 境目の直前なら、その境目
+        let next = clock.next_change(t0 + Duration::from_millis(66));
+        assert_eq!(clock.frame_at(next), 2);
+        assert!(next > t0 + Duration::from_millis(66));
+        // 進まない時計（fps 0）でも眠りすぎない
+        let stopped = Clock { frames_per_sec: 0.0, ..clock };
+        assert!(stopped.next_change(t0) <= t0 + MAX_WAIT);
     }
 
     #[test]
-    fn rejects_short_buffer() {
-        assert!(composite(&[0u8; 4], 2, 1, &Compose { background: [0, 0, 0], ignore_alpha: false }).is_none());
-        assert!(composite(&[], 0, 0, &Compose { background: [0, 0, 0], ignore_alpha: false }).is_none());
+    fn join_until_hands_back_running_thread() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let h = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let left = join_until(h, Instant::now() + Duration::from_millis(30)).expect("終わっていないので返す");
+        let _ = tx.send(());
+        assert!(join_until(left, Instant::now() + Duration::from_secs(5)).is_none());
     }
 
-    const BLACK: Compose = Compose { background: [0, 0, 0], ignore_alpha: false };
-
     #[test]
-    fn converts_straight_rgba_over_background() {
-        // 不透明の赤、半透明（α 128）の白、透明（色が残っていても出さない）
-        let raw = [255, 0, 0, 255, 255, 255, 255, 128, 200, 100, 50, 0];
-        let mut premul = Vec::new();
-        to_premul_rgba8(&raw, 3, 1, PixelFormat::RgbaStraight8, &mut premul);
-        assert_eq!(premul, vec![255, 0, 0, 255, 128, 128, 128, 128, 0, 0, 0, 0]);
-        let f = composite(&premul, 3, 1, &BLACK).expect("合成できる");
-        assert_eq!(&f.bgra[0..4], &[0, 0, 255, 255]);
-        assert_eq!(&f.bgra[4..8], &[128, 128, 128, 255]);
-        assert_eq!(&f.bgra[8..12], &[0, 0, 0, 255]);
-        // 透明部分には背景色（R3 G0 B46）
-        let blue = Compose { background: [3, 0, 46], ignore_alpha: false };
-        let f = composite(&premul, 3, 1, &blue).unwrap();
-        assert_eq!(&f.bgra[8..12], &[46, 0, 3, 255]);
-        assert_eq!(&f.bgra[4..8], &[128 + 23, 128, 128 + 1, 255]);
+    fn workers_adopt_until_closed() {
+        let workers = Workers::new();
+        assert!(workers.adopt(std::thread::spawn(|| {})).is_ok());
+        assert_eq!(workers.close_and_join(Instant::now() + Duration::from_secs(5)), 0);
+        assert!(workers.adopt(std::thread::spawn(|| {})).is_err(), "閉じた後は預からない");
     }
 
     fn monitor(w: i32, h: i32) -> RECT {
